@@ -23,7 +23,7 @@ You don't need to know anything about coding to use this app. Just follow these 
 
 ### Option 1: Download the Ready-to-Use App (Easiest)
 
-1. Go to the [**Releases**](https://github.com/roy8in/memstat/releases/tag/v1.0.0) section of this GitHub repository (or download the `MemStat.app.tar.gz` file directly from the repo).
+1. Go to the [**Releases**](https://github.com/roy8in/memstat/releases/tag/v1.0.0) section of this GitHub repository.
 2. Unzip the file to get `MemStat.app`.
 3. Drag and drop `MemStat.app` into your Mac's **Applications** (`/Applications`) folder.
 4. **Important (Gatekeeper Bypass):** Because this app isn't signed by a paid Apple Developer account, macOS will block it the first time.
