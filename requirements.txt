@@ -1,0 +1,4 @@
+rumps
+psutil
+py2app
+pyobjc-framework-Cocoa
