@@ -1,4 +1,5 @@
-rumps
-psutil
-py2app
-pyobjc-framework-Cocoa
+rumps==0.4.0
+psutil==7.2.2
+py2app==0.28.9
+pyobjc-core==11.1
+pyobjc-framework-Cocoa==11.1

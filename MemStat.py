@@ -1,4 +1,6 @@
 import getpass
+import re
+import subprocess
 import rumps
 import psutil
 import objc
@@ -7,6 +9,42 @@ from AppKit import (
     NSFont, NSFontAttributeName, NSMutableParagraphStyle, NSTextTab,
     NSParagraphStyleAttributeName, NSRightTextAlignment
 )
+
+BYTES_PER_GIB = 1024 ** 3
+
+
+def bytes_to_gib(value):
+    return value / BYTES_PER_GIB
+
+
+def used_memory_percent(mem):
+    """Return a percent that matches the displayed used/total numbers."""
+    if not mem.total:
+        return 0
+    return (mem.used / mem.total) * 100
+
+
+def get_vm_stat_compressed_gib():
+    """Read macOS compressor usage, which psutil does not expose reliably."""
+    try:
+        output = subprocess.check_output(
+            ["vm_stat"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+        )
+    except Exception:
+        return None
+
+    page_size_match = re.search(r"page size of (\d+) bytes", output)
+    compressor_match = re.search(r"Pages occupied by compressor:\s+(\d+)\.", output)
+    if not page_size_match or not compressor_match:
+        return None
+
+    page_size = int(page_size_match.group(1))
+    compressor_pages = int(compressor_match.group(1))
+    return bytes_to_gib(compressor_pages * page_size)
+
 
 class MenuDelegate(NSObject):
     def initWithApp_(self, app):
@@ -25,7 +63,7 @@ class MenuDelegate(NSObject):
 class MemStatApp(rumps.App):
     def __init__(self):
         super(MemStatApp, self).__init__("MemStat", title="")
-        self.total_gb = psutil.virtual_memory().total / (1024 ** 3)
+        self.total_gb = bytes_to_gib(psutil.virtual_memory().total)
         self.username = getpass.getuser()
         self.is_menu_open = False
         self.delegate_set = False
@@ -43,7 +81,7 @@ class MemStatApp(rumps.App):
                 pass
 
         mem = psutil.virtual_memory()
-        percent = mem.percent
+        percent = used_memory_percent(mem)
         
         # iStat Menus와 같이 깔끔한 원형 기호(●)로 대체 (이미지 렌더링 실패 우회)
         text = f"● {percent:.0f}%"
@@ -165,18 +203,22 @@ class MemStatApp(rumps.App):
         mem = psutil.virtual_memory()
         swap = psutil.swap_memory()
         
-        used_gb = mem.used / (1024**3)
-        total_gb = mem.total / (1024**3)
-        percent = mem.percent
+        used_gb = bytes_to_gib(mem.used)
+        total_gb = bytes_to_gib(mem.total)
+        available_gb = bytes_to_gib(mem.available)
+        percent = used_memory_percent(mem)
         
         header_text = f"Memory: {used_gb:.1f} GB / {total_gb:.1f} GB ({percent:.0f}%)"
         self.menu.add(self.create_bold_menu_item(header_text))
         self.menu.add(rumps.separator)
         
-        wired = getattr(mem, 'wired', 0) / (1024**3)
-        compressed = getattr(mem, 'compressed', 0) / (1024**3)
-        swap_used = swap.used / (1024**3)
+        wired = bytes_to_gib(getattr(mem, 'wired', 0))
+        compressed = get_vm_stat_compressed_gib()
+        if compressed is None:
+            compressed = bytes_to_gib(getattr(mem, 'compressed', 0))
+        swap_used = bytes_to_gib(swap.used)
         
+        self.menu.add(self.create_system_item("Available:", available_gb))
         self.menu.add(self.create_system_item("Wired:", wired))
         self.menu.add(self.create_system_item("Compressed:", compressed))
         self.menu.add(self.create_system_item("Swap Used:", swap_used))
