@@ -1,19 +1,22 @@
+"""Build the menu-bar app with py2app."""
+
 from setuptools import setup
 
-APP = ['MemStat.py']
-DATA_FILES = []
+APP = ["MemStat.py"]
 OPTIONS = {
-    'argv_emulation': True,
-    'plist': {
-        'LSUIElement': True,  # 독(Dock)에 아이콘을 표시하지 않음
+    "argv_emulation": False,
+    "plist": {
+        "LSUIElement": True,
+        "CFBundleName": "MemStat",
+        "CFBundleDisplayName": "MemStat",
     },
-    'packages': ['rumps', 'psutil', 'AppKit'],
+    "packages": ["rumps", "psutil", "AppKit"],
+    "includes": ["memstat_core", "PyObjCTools.AppHelper"],
 }
 
 setup(
     app=APP,
-    name='MemStat',
-    data_files=DATA_FILES,
-    options={'py2app': OPTIONS},
-    setup_requires=['py2app'],
+    name="MemStat",
+    options={"py2app": OPTIONS},
+    setup_requires=["py2app"],
 )
