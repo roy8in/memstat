@@ -1,262 +1,550 @@
+"""Native-looking macOS memory monitor in the menu bar."""
+
 import getpass
-import re
+import logging
+import os
 import subprocess
-import rumps
-import psutil
+import threading
+
 import objc
+import psutil
+import rumps
 from AppKit import (
-    NSAttributedString, NSColor, NSForegroundColorAttributeName, NSObject,
-    NSFont, NSFontAttributeName, NSMutableParagraphStyle, NSTextTab,
-    NSParagraphStyleAttributeName, NSRightTextAlignment
+    NSAttributedString,
+    NSFont,
+    NSFontAttributeName,
+    NSImage,
+    NSImageLeft,
+    NSObject,
+    NSParagraphStyleAttributeName,
+    NSRightTextAlignment,
+    NSTextTab,
+    NSMutableParagraphStyle,
+    NSWorkspace,
+)
+from PyObjCTools import AppHelper
+
+from memstat_core import (
+    format_gib,
+    format_process_memory,
+    get_compressor_bytes,
+    group_processes,
+    process_identity_matches,
+    sample_memory,
+    sample_processes,
 )
 
-BYTES_PER_GIB = 1024 ** 3
-
-
-def bytes_to_gib(value):
-    return value / BYTES_PER_GIB
-
-
-def used_memory_percent(mem):
-    """Return a percent that matches the displayed used/total numbers."""
-    if not mem.total:
-        return 0
-    return (mem.used / mem.total) * 100
-
-
-def get_vm_stat_compressed_gib():
-    """Read macOS compressor usage, which psutil does not expose reliably."""
-    try:
-        output = subprocess.check_output(
-            ["vm_stat"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-            timeout=1,
-        )
-    except Exception:
-        return None
-
-    page_size_match = re.search(r"page size of (\d+) bytes", output)
-    compressor_match = re.search(r"Pages occupied by compressor:\s+(\d+)\.", output)
-    if not page_size_match or not compressor_match:
-        return None
-
-    page_size = int(page_size_match.group(1))
-    compressor_pages = int(compressor_match.group(1))
-    return bytes_to_gib(compressor_pages * page_size)
+LOG = logging.getLogger(__name__)
+TOP_GROUP_COUNT = 7
+MORE_GROUP_COUNT = 20
+TOP_PROCESS_COUNT = 15
+PROTECTED_NAMES = frozenset({
+    "launchd", "loginwindow", "WindowServer", "kernel_task", "MemStat",
+})
 
 
 class MenuDelegate(NSObject):
+    """Keep the menu stable while it is being used."""
+
     def initWithApp_(self, app):
         self = objc.super(MenuDelegate, self).init()
-        if self:
+        if self is not None:
             self.app = app
         return self
 
     def menuWillOpen_(self, menu):
-        self.app.is_menu_open = True
-        self.app.update_menu_list(None)
+        self.app.on_menu_open()
 
     def menuDidClose_(self, menu):
-        self.app.is_menu_open = False
+        self.app.on_menu_close()
+
 
 class MemStatApp(rumps.App):
     def __init__(self):
-        super(MemStatApp, self).__init__("MemStat", title="")
-        self.total_gb = bytes_to_gib(psutil.virtual_memory().total)
+        super().__init__("MemStat", title="—", quit_button=None)
         self.username = getpass.getuser()
         self.is_menu_open = False
         self.delegate_set = False
-        self.update_menu_list(None)
+        self.menu_generation = 0
+        self._status_symbol = None
+        self._sample_inflight = False
+        self._compressor_inflight = False
+        self._group_rows = []
+        self._process_rows = []
+        self._process_by_pid = {}
+        self._summary_rows = {}
+        self.menu.add(rumps.MenuItem("MemStat is starting…"))
+        self.menu.add(rumps.MenuItem(
+            "Quit MemStat", callback=rumps.quit_application
+        ))
 
     @rumps.timer(2)
-    def update_title_timer(self, _):
-        if not self.delegate_set and hasattr(self, '_nsapp'):
-            try:
-                self.delegate = MenuDelegate.alloc().initWithApp_(self)
-                self._nsapp.nsstatusitem.menu().setDelegate_(self.delegate)
-                self.delegate_set = True
-                self._nsapp.nsstatusitem.button().setImage_(None)
-            except Exception:
-                pass
-
-        mem = psutil.virtual_memory()
-        percent = used_memory_percent(mem)
-        
-        # iStat Menus와 같이 깔끔한 원형 기호(●)로 대체 (이미지 렌더링 실패 우회)
-        text = f"● {percent:.0f}%"
+    def update_status_timer(self, _):
+        if not self.delegate_set and hasattr(self, "_nsapp"):
+            self._attach_menu_delegate()
         try:
-            if hasattr(self, '_nsapp'):
-                rich_title = NSAttributedString.alloc().initWithString_(text)
-                mutable_rich_title = rich_title.mutableCopy()
-                
-                if percent < 70:
-                    color = NSColor.systemGreenColor()
-                elif percent < 90:
-                    color = NSColor.systemYellowColor()
-                else:
-                    color = NSColor.systemRedColor()
-                    
-                mutable_rich_title.addAttribute_value_range_(
-                    NSForegroundColorAttributeName, color, (0, 1) # '●' 부분에만 색상 적용
+            memory = sample_memory()
+            percent = memory.used_percent
+            if hasattr(self, "_nsapp"):
+                button = self._nsapp.nsstatusitem.button()
+                button.setTitle_(f"{percent:.0f}%")
+                if self._status_symbol is not None:
+                    button.setImage_(self._status_symbol)
+                button.setImagePosition_(NSImageLeft)
+                button.setFont_(
+                    NSFont.monospacedDigitSystemFontOfSize_weight_(12.0, 0.0)
                 )
-                self._nsapp.nsstatusitem.setAttributedTitle_(mutable_rich_title)
             else:
-                self.title = text
-        except Exception:
-            self.title = text
+                self.title = f"{percent:.0f}%"
+            if self.is_menu_open:
+                self._update_summary(memory)
+        except (OSError, AttributeError, ValueError):
+            LOG.exception("Unable to refresh memory status")
 
-    @rumps.timer(1)
-    def active_refresh_timer(self, _):
-        if self.is_menu_open:
-            self.update_menu_list(None)
+    @rumps.timer(5)
+    def update_open_menu_timer(self, _):
+        if not self.is_menu_open:
+            return
+        self._request_process_sample()
+        self._request_compressor_sample()
 
-    def get_top_processes(self):
-        processes = []
-        for proc in psutil.process_iter(['pid', 'name', 'username', 'memory_info']):
-            try:
-                info = proc.info
-                if info['username'] == self.username and info['memory_info'] is not None:
-                    rss = info['memory_info'].rss / (1024 ** 2)
-                    processes.append({'pid': info['pid'], 'name': info['name'], 'rss': rss})
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-        return sorted(processes, key=lambda x: x['rss'], reverse=True)[:15]
+    def _attach_menu_delegate(self):
+        try:
+            self.delegate = MenuDelegate.alloc().initWithApp_(self)
+            self._nsapp.nsstatusitem.menu().setDelegate_(self.delegate)
+            self.delegate_set = True
+            self._rebuild_menu()
+        except (AttributeError, ValueError):
+            LOG.exception("Could not attach native menu delegate")
+            self._rebuild_menu()
+            return
+        try:
+            symbol = (
+                NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                    "memorychip", "Memory usage"
+                )
+            )
+            if symbol is not None:
+                symbol.setTemplate_(True)
+                self._status_symbol = symbol
+        except (AttributeError, ValueError):
+            # SF Symbols are not available on macOS 10.15.
+            LOG.info("Using percentage-only status item")
 
-    def create_bold_menu_item(self, text):
-        item = rumps.MenuItem(text)
-        attributes = {
-            NSFontAttributeName: NSFont.boldSystemFontOfSize_(14)
-        }
-        attr_str = NSAttributedString.alloc().initWithString_attributes_(text, attributes)
-        item._menuitem.setAttributedTitle_(attr_str)
+    def on_menu_open(self):
+        self.is_menu_open = True
+        self._rebuild_menu()
+        self._request_compressor_sample()
+
+    def on_menu_close(self):
+        self.is_menu_open = False
+        self.menu_generation += 1
+
+    @staticmethod
+    def _make_item(label, callback=None, bold=False):
+        item = rumps.MenuItem(label, callback=callback)
+        if bold:
+            font = NSFont.boldSystemFontOfSize_(12.5)
+            attributes = {NSFontAttributeName: font}
+            title = NSAttributedString.alloc().initWithString_attributes_(
+                label, attributes
+            )
+            item._menuitem.setAttributedTitle_(title)
         return item
 
-    def create_system_item(self, label, value_gb):
-        """Wired/Compressed/Swap 항목용 정렬 아이템"""
-        # 레이블 길이 제한 없음 (짧으므로), 숫자 부분만 포맷팅
-        val_str = f"{value_gb:.2f} GB"
-        text = f"{label}\t{val_str}"
-        item = rumps.MenuItem(text)
-        
-        # 1. 기본 폰트 및 탭 설정
-        sys_font = NSFont.menuBarFontOfSize_(14.0)
-        paragraph_style = NSMutableParagraphStyle.alloc().init()
-        tab = NSTextTab.alloc().initWithTextAlignment_location_options_(NSRightTextAlignment, 240, {})
-        paragraph_style.setTabStops_([tab])
-        
+    @staticmethod
+    def _set_two_column(item, label, value, emphasis=False):
+        """Align values without relying on spaces in proportional fonts."""
+        content = f"{label}\t{value}"
+        paragraph = NSMutableParagraphStyle.alloc().init()
+        tab = NSTextTab.alloc().initWithTextAlignment_location_options_(
+            NSRightTextAlignment, 254, {}
+        )
+        paragraph.setTabStops_([tab])
+        text_font = (NSFont.boldSystemFontOfSize_(12.5) if emphasis
+                     else NSFont.menuFontOfSize_(13.0))
         attributes = {
-            NSFontAttributeName: sys_font,
-            NSParagraphStyleAttributeName: paragraph_style
+            NSFontAttributeName: text_font,
+            NSParagraphStyleAttributeName: paragraph,
         }
-        
-        attr_str = NSAttributedString.alloc().initWithString_attributes_(text, attributes)
-        mutable_attr_str = attr_str.mutableCopy()
-        
-        # 2. 숫자 부분에만 고정폭(Monospaced Digit) 적용하여 정렬 보장
-        mono_font = NSFont.monospacedDigitSystemFontOfSize_weight_(14.0, 0.0)
-        val_range = (len(label) + 1, len(val_str))
-        mutable_attr_str.addAttribute_value_range_(NSFontAttributeName, mono_font, val_range)
-        
-        item._menuitem.setAttributedTitle_(mutable_attr_str)
+        title = NSAttributedString.alloc().initWithString_attributes_(
+            content, attributes
+        ).mutableCopy()
+        digit_font = NSFont.monospacedDigitSystemFontOfSize_weight_(
+            12.5, 0.0
+        )
+        offset = len((label + "\t").encode("utf-16-le")) // 2
+        length = len(value.encode("utf-16-le")) // 2
+        title.addAttribute_value_range_(
+            NSFontAttributeName, digit_font, (offset, length)
+        )
+        item._menuitem.setAttributedTitle_(title)
+
+    def _add_summary(self, label, value, key=None, emphasis=False):
+        item = self._make_item(label)
+        self._set_two_column(item, label, value, emphasis=emphasis)
+        self.menu.add(item)
+        if key is not None:
+            self._summary_rows[key] = (item, label, emphasis)
         return item
 
-    def create_menu_item(self, app_name, memory_mb, callback, pid, proc_name):
-        """앱 리스트 정렬 아이템 (이름 자르기 및 숫자 고정폭 적용)"""
-        # 앱 이름이 너무 길면 탭이 밀리는 현상을 방지하기 위해 20자로 제한하고 말줄임표 처리
-        display_name = app_name
-        if len(display_name) > 20:
-            display_name = display_name[:19] + "…"
-            
-        # 숫자 부분 포맷 (예: '1015.6 MB', ' 585.4 MB') -> 소수점 앞을 맞추기 위해 공간 확보
-        val_str = f"{memory_mb:>6.1f} MB"
-        text = f"{display_name}\t{val_str}"
-        
-        item = rumps.MenuItem(text, callback=callback)
-        item.pid = pid
-        item.proc_name = proc_name
-        
-        # 1. 기본 시스템 폰트 및 탭 설정
-        sys_font = NSFont.menuBarFontOfSize_(14.0)
-        paragraph_style = NSMutableParagraphStyle.alloc().init()
-        tab = NSTextTab.alloc().initWithTextAlignment_location_options_(NSRightTextAlignment, 240, {})
-        paragraph_style.setTabStops_([tab])
-        
-        attributes = {
-            NSFontAttributeName: sys_font,
-            NSParagraphStyleAttributeName: paragraph_style
-        }
-        
-        attr_str = NSAttributedString.alloc().initWithString_attributes_(text, attributes)
-        mutable_attr_str = attr_str.mutableCopy()
-        
-        # 2. 숫자(메모리) 부분에만 고정폭 숫자 폰트 적용
-        mono_font = NSFont.monospacedDigitSystemFontOfSize_weight_(14.0, 0.0)
-        val_range = (len(display_name) + 1, len(val_str))
-        mutable_attr_str.addAttribute_value_range_(NSFontAttributeName, mono_font, val_range)
-        
-        item._menuitem.setAttributedTitle_(mutable_attr_str)
-        return item
+    @staticmethod
+    def _truncate(text, maximum=26):
+        return text if len(text) <= maximum else text[:maximum - 1] + "…"
 
-    def update_menu_list(self, _):
+    def _get_running_apps(self):
+        """Use macOS application identities, not a guessed name prefix."""
+        running = {}
+        try:
+            for app in NSWorkspace.sharedWorkspace().runningApplications():
+                bundle_url = app.bundleURL()
+                if bundle_url is None:
+                    continue
+                path = str(bundle_url.path())
+                if not path:
+                    continue
+                name = str(app.localizedName() or "")
+                running[path] = (name or path.rsplit("/", 1)[-1][:-4],
+                                 int(app.processIdentifier()))
+        except (AttributeError, ValueError):
+            LOG.exception("Application metadata is unavailable")
+        return running
+
+    def _rebuild_menu(self):
+        """Only rebuild before opening, never while navigating an open menu."""
+        self.menu_generation += 1
         self.menu.clear()
-        mem = psutil.virtual_memory()
-        swap = psutil.swap_memory()
-        
-        used_gb = bytes_to_gib(mem.used)
-        total_gb = bytes_to_gib(mem.total)
-        available_gb = bytes_to_gib(mem.available)
-        percent = used_memory_percent(mem)
-        
-        header_text = f"Memory: {used_gb:.1f} GB / {total_gb:.1f} GB ({percent:.0f}%)"
-        self.menu.add(self.create_bold_menu_item(header_text))
-        self.menu.add(rumps.separator)
-        
-        wired = bytes_to_gib(getattr(mem, 'wired', 0))
-        compressed = get_vm_stat_compressed_gib()
-        if compressed is None:
-            compressed = bytes_to_gib(getattr(mem, 'compressed', 0))
-        swap_used = bytes_to_gib(swap.used)
-        
-        self.menu.add(self.create_system_item("Available:", available_gb))
-        self.menu.add(self.create_system_item("Wired:", wired))
-        self.menu.add(self.create_system_item("Compressed:", compressed))
-        self.menu.add(self.create_system_item("Swap Used:", swap_used))
-        
-        self.menu.add(rumps.separator)
-        # 행 전체가 클릭 영역이므로 클릭 시 종료됨을 명시
-        self.menu.add(self.create_bold_menu_item("Top Processes (Click Row to Terminate)"))
+        self._group_rows = []
+        self._process_rows = []
+        self._summary_rows = {}
+        try:
+            memory = sample_memory()
+        except (OSError, psutil.Error):
+            LOG.exception("Could not read system memory")
+            memory = None
 
-        top_procs = self.get_top_processes()
-        for proc in top_procs:
-            self.menu.add(self.create_menu_item(
-                app_name=proc['name'],
-                memory_mb=proc['rss'],
-                callback=self.terminate_app,
-                pid=proc['pid'],
-                proc_name=proc['name']
+        if memory is not None:
+            self._add_summary(
+                "Memory", f"{format_gib(memory.used)} / "
+                f"{format_gib(memory.total)}", "memory", emphasis=True
+            )
+            self._add_summary(
+                "Memory Pressure", memory.pressure, "pressure"
+            )
+            self.menu.add(rumps.separator)
+            self._add_summary(
+                "Available", format_gib(memory.available), "available"
+            )
+            self._add_summary("Wired", format_gib(memory.wired), "wired")
+            self._add_summary("Compressed", "—", "compressed")
+            self._add_summary(
+                "Swap Used", format_gib(memory.swap_used), "swap"
+            )
+        else:
+            self.menu.add(self._make_item("Memory information unavailable"))
+
+        self.menu.add(rumps.separator)
+        self.menu.add(self._make_item(
+            "TOP APPLICATIONS  ·  SUMMED RSS", bold=True
+        ))
+
+        try:
+            records = sample_processes(self.username, os.getpid())
+            groups = group_processes(records, self._get_running_apps())
+        except (OSError, psutil.Error):
+            LOG.exception("Could not enumerate processes")
+            records, groups = [], []
+        self._process_by_pid = {record.pid: record for record in records}
+
+        for group in groups[:TOP_GROUP_COUNT]:
+            self._add_group_item(self.menu, group)
+
+        remaining = groups[TOP_GROUP_COUNT:
+                           TOP_GROUP_COUNT + MORE_GROUP_COUNT]
+        if remaining:
+            more_item = self._make_item("More Applications & Processes")
+            for group in remaining:
+                self._add_group_item(more_item, group)
+            self.menu.add(more_item)
+
+        if not groups:
+            self.menu.add(self._make_item("No accessible processes"))
+        elif len(groups) > TOP_GROUP_COUNT + MORE_GROUP_COUNT:
+            count = len(groups) - TOP_GROUP_COUNT - MORE_GROUP_COUNT
+            self.menu.add(self._make_item(
+                f"{count} other groups (open Activity Monitor)",
+                callback=self._open_activity_monitor,
             ))
 
         self.menu.add(rumps.separator)
-        self.menu.add(rumps.MenuItem("Terminate MemStat", callback=rumps.quit_application))
+        self.menu.add(self._make_item(
+            "Open Activity Monitor", callback=self._open_activity_monitor
+        ))
+        self.menu.add(self._make_item(
+            "Quit MemStat", callback=rumps.quit_application
+        ))
 
-    def terminate_app(self, sender):
-        try:
-            if not getattr(sender, 'pid', None): return
-            pid = sender.pid
-            name = sender.proc_name
-            response = rumps.alert(
-                title="Terminate Process",
-                message=f"Are you sure you want to terminate '{name}' (PID: {pid})?",
-                ok="Terminate",
-                cancel="Cancel"
+    def _add_group_item(self, parent, group):
+        name = self._truncate(group.name)
+        value = format_process_memory(group.rss)
+        item = self._make_item(name)
+        self._set_two_column(item, name, value)
+        item._menuitem.setToolTip_(
+            f"{group.name}: sum of process RSS; shared memory may be "
+            "counted more than once"
+        )
+        if group.bundle_path:
+            try:
+                icon = NSWorkspace.sharedWorkspace().iconForFile_(
+                    group.bundle_path
+                )
+                if icon is not None:
+                    icon.setSize_((16, 16))
+                    item._menuitem.setImage_(icon)
+            except (OSError, AttributeError):
+                LOG.debug("No icon available for %s", group.bundle_path)
+
+        item.add(self._make_item(
+            f"{group.name}  ·  {len(group.records)} processes",
+            bold=True,
+        ))
+        item.add(self._make_item(
+            f"Summed RSS: {format_process_memory(group.rss)}"
+        ))
+        item.add(rumps.separator)
+        for record in group.records[:TOP_PROCESS_COUNT]:
+            self._add_process_item(item, record)
+        if len(group.records) > TOP_PROCESS_COUNT:
+            remaining = len(group.records) - TOP_PROCESS_COUNT
+            item.add(self._make_item(
+                f"{remaining} more processes — see Activity Monitor",
+                callback=self._open_activity_monitor,
+            ))
+
+        if group.app_pid in self._process_by_pid:
+            item.add(rumps.separator)
+            quit_item = self._make_item(
+                "Quit Application…", callback=self._request_app_quit
             )
-            if response == 1:
-                psutil.Process(pid).terminate()
-                rumps.notification("MemStat", "Terminated", f"'{name}' has been closed.")
-                self.update_menu_list(None)
-        except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-            rumps.alert("Error", str(e))
+            quit_item.process_record = self._process_by_pid[group.app_pid]
+            quit_item.app_name = group.name
+            item.add(quit_item)
+
+        parent.add(item)
+        self._group_rows.append((group, item, name))
+
+    def _add_process_item(self, parent, record):
+        label = self._truncate(record.name, 24)
+        item = self._make_item(label)
+        self._set_two_column(
+            item, label, format_process_memory(record.rss)
+        )
+        item._menuitem.setToolTip_(
+            f"{record.name} (PID {record.pid})\nRSS: "
+            f"{format_process_memory(record.rss)}"
+        )
+        item.add(self._make_item(record.name))
+        item.add(self._make_item(f"PID: {record.pid}"))
+        item.add(self._make_item(
+            f"RSS: {format_process_memory(record.rss)}"
+        ))
+        item.add(rumps.separator)
+        terminate = self._make_item(
+            "Terminate Process…", callback=self._request_termination
+        )
+        terminate.process_record = record
+        item.add(terminate)
+        parent.add(item)
+        self._process_rows.append((record, item, label))
+
+    def _update_summary(self, memory):
+        updates = {
+            "memory": f"{format_gib(memory.used)} / "
+                      f"{format_gib(memory.total)}",
+            "pressure": memory.pressure,
+            "available": format_gib(memory.available),
+            "wired": format_gib(memory.wired),
+            "swap": format_gib(memory.swap_used),
+        }
+        for key, value in updates.items():
+            if key not in self._summary_rows:
+                continue
+            item, label, emphasis = self._summary_rows[key]
+            self._set_two_column(item, label, value, emphasis)
+
+    def _request_compressor_sample(self):
+        if self._compressor_inflight:
+            return
+        self._compressor_inflight = True
+        generation = self.menu_generation
+
+        def worker():
+            try:
+                value = get_compressor_bytes()
+            except Exception:
+                LOG.exception("Compressor query failed")
+                value = None
+            AppHelper.callAfter(self._show_compressor, generation, value)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_compressor(self, generation, compressed):
+        self._compressor_inflight = False
+        if not self.is_menu_open or generation != self.menu_generation:
+            return
+        if "compressed" in self._summary_rows:
+            item, label, _ = self._summary_rows["compressed"]
+            value = format_gib(compressed) if compressed is not None else "—"
+            self._set_two_column(item, label, value)
+
+    def _request_process_sample(self):
+        if self._sample_inflight:
+            return
+        self._sample_inflight = True
+        generation = self.menu_generation
+
+        def worker():
+            try:
+                processes = sample_processes(self.username, os.getpid())
+            except Exception:
+                LOG.exception("Background process sample failed")
+                processes = None
+            AppHelper.callAfter(self._update_process_values,
+                                generation, processes)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_process_values(self, generation, processes):
+        self._sample_inflight = False
+        if not self.is_menu_open or generation != self.menu_generation:
+            return
+        if processes is None:
+            return
+        latest = {record.pid: record for record in processes}
+        for original, item, label in self._process_rows:
+            current = latest.get(original.pid)
+            if current is None or abs(
+                    current.created - original.created) >= 0.01:
+                item._menuitem.setEnabled_(False)
+                self._set_two_column(item, label, "Exited")
+            else:
+                self._set_two_column(
+                    item, label, format_process_memory(current.rss)
+                )
+        for group, item, name in self._group_rows:
+            total = 0
+            for original in group.records:
+                current = latest.get(original.pid)
+                if current and abs(
+                        current.created - original.created) < 0.01:
+                    total += current.rss
+            self._set_two_column(item, name, format_process_memory(total))
+
+    def _check_safe_process(self, record):
+        if record.pid == os.getpid() or record.name in PROTECTED_NAMES:
+            rumps.alert("Protected Process", "This process cannot be "
+                        "terminated from MemStat.")
+            return None
+        try:
+            process = psutil.Process(record.pid)
+            if not process_identity_matches(
+                    process, record, self.username):
+                rumps.alert("Process Changed", "The original process "
+                            "is no longer running. Reopen the menu.")
+                return None
+            return process
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            rumps.alert("Process Unavailable", "Reopen the menu to refresh.")
+            return None
+
+    def _request_termination(self, sender):
+        record = sender.process_record
+        process = self._check_safe_process(record)
+        if process is None:
+            return
+        response = rumps.alert(
+            title="Terminate Process",
+            message=(f"Terminate {record.name} (PID {record.pid})?\n"
+                     "Unsaved changes may be lost."),
+            ok="Terminate",
+            cancel="Cancel",
+        )
+        if response != 1:
+            return
+        if not process_identity_matches(process, record, self.username):
+            rumps.alert("Process Changed", "The process changed while "
+                        "confirmation was open. Nothing was terminated.")
+            return
+        try:
+            process.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied) as error:
+            rumps.alert("Could Not Terminate Process", str(error))
+            return
+        self._verify_exit_in_background(process, record.name)
+
+    def _request_app_quit(self, sender):
+        record = sender.process_record
+        process = self._check_safe_process(record)
+        if process is None:
+            return
+        response = rumps.alert(
+            title="Quit Application",
+            message=(f"Ask {sender.app_name} to quit?\n"
+                     "Save your work before continuing."),
+            ok="Quit",
+            cancel="Cancel",
+        )
+        if response != 1:
+            return
+        if not process_identity_matches(process, record, self.username):
+            rumps.alert("Process Changed", "The application has changed. "
+                        "Reopen the menu.")
+            return
+        try:
+            app = NSWorkspace.sharedWorkspace().runningApplications()
+            matching = next(
+                (item for item in app
+                 if int(item.processIdentifier()) == record.pid), None
+            )
+            if matching is None or not matching.terminate():
+                rumps.alert("Quit Not Supported", "The application did "
+                            "not accept the quit request.")
+                return
+        except (AttributeError, ValueError):
+            LOG.exception("Could not send application quit request")
+            rumps.alert("Quit Failed", "Could not request application quit.")
+            return
+        self._verify_exit_in_background(process, sender.app_name)
+
+    @staticmethod
+    def _verify_exit_in_background(process, name):
+        def worker():
+            try:
+                process.wait(timeout=3.0)
+                title, message = "Closed", f"{name} has exited."
+            except psutil.NoSuchProcess:
+                title, message = "Closed", f"{name} has exited."
+            except (psutil.TimeoutExpired, psutil.AccessDenied):
+                title = "Still Running"
+                message = f"{name} did not exit within three seconds."
+            AppHelper.callAfter(
+                rumps.notification, "MemStat", title, message
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _open_activity_monitor(_):
+        try:
+            subprocess.Popen(
+                ["/usr/bin/open", "-a", "Activity Monitor"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            rumps.alert("Unable to open Activity Monitor")
+
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.WARNING)
     MemStatApp().run()

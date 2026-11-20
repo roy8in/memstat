@@ -1,0 +1,107 @@
+name: Build Apple Silicon App
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and check arm64 app
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Require native Apple Silicon
+        run: |
+          test "$(uname -m)" = "arm64"
+          python -c "import platform; assert platform.machine() == 'arm64'"
+
+      - name: Install build requirements
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run tests and import checks
+        run: |
+          python -m unittest discover -s tests -v
+          python -m compileall -q MemStat.py memstat_core.py
+          python -c "import MemStat; import memstat_core"
+
+      - name: Build standalone application
+        run: python setup.py py2app
+
+      - name: Thin bundle to arm64 and re-sign
+        run: |
+          mv dist/MemStat.app dist/MemStat-unthinned.app
+          ditto --arch arm64 dist/MemStat-unthinned.app dist/MemStat.app
+          rm -rf dist/MemStat-unthinned.app
+          codesign --force --deep --sign - dist/MemStat.app
+
+      - name: Validate bundle architecture and metadata
+        run: |
+          set -euxo pipefail
+          test -x dist/MemStat.app/Contents/MacOS/MemStat
+          test "$(lipo -archs dist/MemStat.app/Contents/MacOS/MemStat)" = "arm64"
+          /usr/libexec/PlistBuddy -c "Print :LSUIElement" dist/MemStat.app/Contents/Info.plist | grep -qi '^true$'
+          /usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" dist/MemStat.app/Contents/Info.plist | grep -q MemStat
+          while IFS= read -r -d '' binary; do
+            arches="$(lipo -archs "$binary" 2>/dev/null || true)"
+            if [[ -n "$arches" && "$arches" != "arm64" ]]; then
+              echo "Unexpected architectures ($arches): $binary"
+              exit 1
+            fi
+          done < <(find dist/MemStat.app -type f -print0)
+          codesign --verify --deep --strict dist/MemStat.app
+
+      - name: Package app for Finder installation
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent dist/MemStat.app MemStat-AppleSilicon.zip
+          shasum -a 256 MemStat-AppleSilicon.zip > MemStat-AppleSilicon.zip.sha256
+
+      - name: Upload installable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MemStat-AppleSilicon
+          path: |
+            MemStat-AppleSilicon.zip
+            MemStat-AppleSilicon.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish preview release
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download built app
+        uses: actions/download-artifact@v4
+        with:
+          name: MemStat-AppleSilicon
+
+      - name: Create preview release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: v1.1.0-beta.1
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; refusing to overwrite it."
+            exit 0
+          fi
+          gh release create "$RELEASE_TAG" MemStat-AppleSilicon.zip MemStat-AppleSilicon.zip.sha256 --repo "$GH_REPO" --target "$GITHUB_SHA" --title "MemStat $RELEASE_TAG (Apple Silicon)" --prerelease --notes "Apple Silicon-only preview app. Download MemStat-AppleSilicon.zip, extract MemStat.app and move it into Applications. Automated tests and packaging checks passed; interactive UI on a physical Mac remains untested. Not Developer ID signed or notarized. See README for the safe first-launch procedure."
