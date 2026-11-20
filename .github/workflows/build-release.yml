@@ -43,59 +43,19 @@ jobs:
       - name: Build standalone application
         run: python setup.py py2app
 
-      - name: Remove other architecture slices and re-sign the app
+      - name: Thin bundle to arm64 and re-sign
         run: |
           mv dist/MemStat.app dist/MemStat-unthinned.app
           ditto --arch arm64 dist/MemStat-unthinned.app dist/MemStat.app
           rm -rf dist/MemStat-unthinned.app
           codesign --force --deep --sign - dist/MemStat.app
 
-      - name: Validate app bundle architecture and metadata
+      - name: Validate bundle architecture and metadata
         run: |
           set -euxo pipefail
           test -x dist/MemStat.app/Contents/MacOS/MemStat
           test "$(lipo -archs dist/MemStat.app/Contents/MacOS/MemStat)" = "arm64"
-          /usr/libexec/PlistBuddy -c "Print :LSUIElement" dist/MemStat.app/Contents/Info.plist | grep -qi '^true
-      - name: Package app for Finder installation
-        run: |
-          ditto -c -k --sequesterRsrc --keepParent dist/MemStat.app MemStat-AppleSilicon.zip
-          shasum -a 256 MemStat-AppleSilicon.zip > MemStat-AppleSilicon.zip.sha256
-
-      - name: Upload installable artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: MemStat-AppleSilicon
-          path: |
-            MemStat-AppleSilicon.zip
-            MemStat-AppleSilicon.zip.sha256
-          if-no-files-found: error
-          retention-days: 30
-
-  publish:
-    name: Publish preview release
-    needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download built app
-        uses: actions/download-artifact@v4
-        with:
-          name: MemStat-AppleSilicon
-
-      - name: Create preview release if it does not exist
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: v1.1.0-beta.1
-        run: |
-          if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
-            echo "Release $RELEASE_TAG already exists; refusing to overwrite it."
-            exit 0
-          fi
-          gh release create "$RELEASE_TAG"             MemStat-AppleSilicon.zip             MemStat-AppleSilicon.zip.sha256             --repo "$GH_REPO"             --target "$GITHUB_SHA"             --title "MemStat $RELEASE_TAG (Apple Silicon)"             --prerelease             --notes "Apple Silicon-only preview app. Download MemStat-AppleSilicon.zip, unzip it, and move MemStat.app into Applications. This preview has passed automated tests and packaging checks, but has not been manually tested on a user's Mac. This build is not Apple Developer ID notarized; see the README for the safe first-launch procedure and known limitations."
-
+          /usr/libexec/PlistBuddy -c "Print :LSUIElement" dist/MemStat.app/Contents/Info.plist | grep -qi '^true$'
           /usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" dist/MemStat.app/Contents/Info.plist | grep -q MemStat
           while IFS= read -r -d '' binary; do
             arches="$(lipo -archs "$binary" 2>/dev/null || true)"
@@ -134,7 +94,7 @@ jobs:
         with:
           name: MemStat-AppleSilicon
 
-      - name: Create preview release if it does not exist
+      - name: Create preview release if missing
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -144,4 +104,4 @@ jobs:
             echo "Release $RELEASE_TAG already exists; refusing to overwrite it."
             exit 0
           fi
-          gh release create "$RELEASE_TAG"             MemStat-AppleSilicon.zip             MemStat-AppleSilicon.zip.sha256             --repo "$GH_REPO"             --target "$GITHUB_SHA"             --title "MemStat $RELEASE_TAG (Apple Silicon)"             --prerelease             --notes "Apple Silicon-only preview app. Download MemStat-AppleSilicon.zip, unzip it, and move MemStat.app into Applications. This preview has passed automated tests and packaging checks, but has not been manually tested on a user's Mac. This build is not Apple Developer ID notarized; see the README for the safe first-launch procedure and known limitations."
+          gh release create "$RELEASE_TAG" MemStat-AppleSilicon.zip MemStat-AppleSilicon.zip.sha256 --repo "$GH_REPO" --target "$GITHUB_SHA" --title "MemStat $RELEASE_TAG (Apple Silicon)" --prerelease --notes "Apple Silicon-only preview app. Download MemStat-AppleSilicon.zip, extract MemStat.app and move it into Applications. Automated tests and packaging checks passed; interactive UI on a physical Mac remains untested. Not Developer ID signed or notarized. See README for the safe first-launch procedure."
