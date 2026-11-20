@@ -1,83 +1,94 @@
-# MemStat for macOS 🖥️
+# MemStat for macOS
 
-A lightweight, native-feeling macOS menu bar application to monitor your RAM usage in real-time and quickly terminate memory-hungry processes. 
+A lightweight macOS menu-bar monitor for memory usage, memory pressure, and
+memory-heavy applications. Built with Python, rumps, psutil, and PyObjC.
 
-![macOS Version](https://img.shields.io/badge/macOS-10.15%2B-blue)
-![Python](https://img.shields.io/badge/Python-3.x-green)
+## What changed on `main` / development branches
 
----
+The menu bar uses a small native memory symbol and a compact percentage, with
+a percentage-only fallback for older macOS versions. The dropdown shows:
 
-## 🌟 Why MemStat?
+- **In-use RAM / total RAM**: the exact numbers used to compute the percentage
+  shown in the menu bar, based on `psutil.virtual_memory().used` (active +
+  wired on macOS). These are **GiB**, not decimal GB.
+- **Memory pressure**: the macOS discrete system level (`Normal`, `Warning`,
+  `Critical`), if available. MemStat attempts the undocumented
+  `kern.memorystatus_vm_pressure_level` sysctl; if unavailable, it displays
+  `Unavailable` instead of inferring health from RAM percentage.
+- **Available, Wired, Compressed, Swap Used**: the compressor entry displays
+  physical pages occupied by the compressor, sourced from `vm_stat`; on failure
+  it shows `—`, never a misleading zero.
+- **Top applications and processes**: known applications are grouped by their
+  outer `.app` bundle, using executable paths and process ancestry. Processes
+  without an identifiable application remain individual entries. The main menu
+  displays seven groups and the More submenu displays up to 20 additional
+  groups. Activity Monitor is available for the full system-wide list.
 
-macOS is great at managing memory, but sometimes a rogue app or browser tab can eat up your RAM and slow down your machine. MemStat lives quietly in your menu bar, showing you exactly how much memory is being used, and lets you kill heavy processes with a single click.
+### Important: process-memory accounting
 
-*   **Native Look & Feel**: Designed to look like an Apple built-in tool. Clean layout, perfectly aligned columns, and a minimal `●` icon that changes color based on system load.
-*   **Zero CPU Overhead**: MemStat is smart. It only updates the heavy process list *while you are looking at the menu*. When the menu is closed, it takes virtually 0% CPU.
-*   **One-Click Kill**: Click any process in the list to instantly kill it (with a safety confirmation prompt).
+The application rows show **summed RSS (resident set size)**, not unique
+physical RAM or Activity Monitor's *Memory* column. Shared pages may be counted
+more than once when aggregating processes. Do not interpret an application's
+summed RSS as the memory that terminating it will release.
 
----
+Click an application to inspect individual processes and their PIDs. Individual
+processes have a separate **Terminate Process…** action. If macOS exposes a
+running application for the group, **Quit Application…** requests a graceful
+application quit. Both operations ask for confirmation and verify that the
+process PID, creation time, and account still match the sampled process. MemStat
+will never use SIGKILL automatically. It excludes its own process and a small
+list of sensitive system processes from manual termination.
 
-## 🚀 How to Install & Run
+## Install and run from source
 
-You don't need to know anything about coding to use this app. Just follow these simple steps:
+A Mac and Python 3 are required. Create a virtual environment:
 
-### Option 1: Download the Ready-to-Use App (Easiest)
+```bash
+git clone https://github.com/roy8in/memstat.git
+cd memstat
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+```
 
-1. Go to the [**Releases**](https://github.com/roy8in/memstat/releases/tag/v1.0.0) section of this GitHub repository.
-2. Unzip the file to get `MemStat.app`.
-3. Drag and drop `MemStat.app` into your Mac's **Applications** (`/Applications`) folder.
-4. **Important (Gatekeeper Bypass):** Because this app isn't signed by a paid Apple Developer account, macOS will block it the first time.
-   * Open the Applications folder in Finder.
-   * Hold the `Control` key on your keyboard and **click** `MemStat.app`, then select **Open**.
-   * Click **Open** again on the warning prompt. (You only have to do this once).
-5. Look at your top right menu bar—you'll see the MemStat icon (`●`)!
+Build the app:
 
-### Option 2: Build from Source (For Developers)
+```bash
+python3 setup.py py2app
+```
 
-If you prefer to build the app yourself using Python:
+Move `dist/MemStat.app` into `/Applications`. To launch at login, add the app
+under **System Settings → General → Login Items**.
 
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/roy8in/memstat.git
-   cd memstat
-   ```
-2. Set up a virtual environment and install dependencies:
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
-3. Build the macOS App:
-   ```bash
-   python3 setup.py py2app
-   ```
-4. Find the built app inside the `dist` folder and move it to `/Applications/`.
+**Release note:** The existing [v1.0.0 release](https://github.com/roy8in/memstat/releases/tag/v1.0.0)
+was created on March 20, 2026. It predates the current development changes.
+Do not assume its downloadable binary includes the updated design. Build from
+source until an updated, tested release is published.
 
----
+## Test
 
-## ⚙️ Setting Up Auto-Start (Launch on Boot)
+Core calculations and grouping logic are platform-independent:
 
-If you want MemStat to start automatically every time you turn on your Mac:
+```bash
+python3 -m unittest discover -s tests -v
+python3 -m compileall -q MemStat.py memstat_core.py
+```
 
-1. Click the **Apple Logo ()** in the top-left corner of your screen -> **System Settings**.
-2. Go to **General** -> **Login Items**.
-3. Under the **"Open at Login"** section, click the **`+`** button.
-4. Navigate to your **Applications** folder, select **`MemStat.app`**, and click **Open**.
+Run the built `.app` on macOS to validate status-item rendering, `NSMenu`
+submenus, application metadata, menu updates, and quit confirmation. Linux
+unit tests cannot validate Cocoa behavior or a macOS `.app` bundle.
 
----
+## Compatibility and limitations
 
-## 📖 How to Use
-
-1. **Check Status**: Glance at the menu bar. The dot color tells you your RAM status:
-   * 🟢 **Green**: Healthy (< 70% used)
-   * 🟡 **Yellow**: Warning (70% - 90% used)
-   * 🔴 **Red**: Critical (> 90% used, expect swapping and slowdowns)
-2. **View Details**: Click the icon to see exactly how your memory is distributed (Wired, Compressed, Swap).
-3. **Kill an App**: See an app using too much memory in the "Top Processes" list? Just click its name. A prompt will ask if you want to terminate it. Click "Terminate" and it's gone.
-
----
-
-## 🛠 Tech Stack
-*   **Language**: Python 3
-*   **Libraries**: `rumps` (Menu bar wrapper), `PyObjC` (macOS native API bridge), `psutil` (System monitoring).
-*   **Builder**: `py2app`
+- SF Symbols are used when available. On older macOS releases, MemStat shows a
+  compact percentage without the memory icon.
+- The memory-pressure sysctl is an **undocumented Apple interface**. It may
+  change or become unavailable in future macOS versions.
+- Compressed usage is measured in the background; it may temporarily display
+  `—` until the read finishes.
+- While the menu is open, numbers refresh without changing row order. Close
+  and reopen the menu to see newly started applications or changes in ranking.
+- Menus group only readable processes owned by the current user. Activity
+  Monitor provides the system-wide view and additional macOS measurements.
+- The source files are not code signed or notarized; follow your organization's
+  Gatekeeper policies rather than bypassing security controls.
